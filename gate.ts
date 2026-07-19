@@ -68,12 +68,15 @@ export const PRESETS: Record<string, GateConfig> = {
   default: { ...DEFAULT_CONFIG },
   strict: { daily_cap: 6, min_gap_minutes: 20, per_session: 2, fire_threshold: 4 },
   "drill-sergeant": { daily_cap: 12, min_gap_minutes: 10, per_session: 3, fire_threshold: 3 },
+  // For one-long-session people: session budget effectively off, gate on
+  // practically every risky diff. The digest + threshold are the only brakes.
+  "every-diff": { daily_cap: 100, min_gap_minutes: 2, per_session: 100, fire_threshold: 3 },
 };
 
 const CONFIG_CLAMPS: Record<keyof GateConfig, [number, number]> = {
-  daily_cap: [1, 50],
+  daily_cap: [1, 200],
   min_gap_minutes: [0, 720],
-  per_session: [1, 10],
+  per_session: [1, 200],
   fire_threshold: [1, 50],
 };
 

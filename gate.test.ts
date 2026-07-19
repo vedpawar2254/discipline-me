@@ -1065,7 +1065,7 @@ describe("config", () => {
     expect(readConfig(sd)).toEqual({ ...DEFAULT_CONFIG, daily_cap: 10 });
     writeFileSync(join(sd, "config.json"), JSON.stringify({ daily_cap: 999, min_gap_minutes: -5, per_session: 2.7 }));
     const c = readConfig(sd);
-    expect(c.daily_cap).toBe(50);
+    expect(c.daily_cap).toBe(200);
     expect(c.min_gap_minutes).toBe(0);
     expect(c.per_session).toBe(3);
     writeFileSync(join(sd, "config.json"), "{{{ nope");
@@ -1134,6 +1134,7 @@ describe("config", () => {
     expect(runCli(["--config", "daily_cap", "many"], sd)).toContain("not a number");
     expect(runCli(["--config", "preset", "drill-sergeant"], sd)).toContain("daily_cap=12");
     expect(readConfig(sd).min_gap_minutes).toBe(10);
+    expect(runCli(["--config", "preset", "every-diff"], sd)).toContain("per_session=100");
     expect(runCli(["--config", "preset", "nope"], sd)).toContain("Unknown preset");
     expect(runCli(["--config", "reset"], sd)).toContain("reset");
     expect(readConfig(sd)).toEqual(DEFAULT_CONFIG);

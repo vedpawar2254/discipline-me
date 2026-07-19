@@ -99,6 +99,12 @@ The presets, for calibration:
 | `default` | 3 | 45 min | 1 | 5 |
 | `strict` | 6 | 20 min | 2 | 4 |
 | `drill-sergeant` | 12 | 10 min | 3 | 3 (almost everything) |
+| `every-diff` | 100 | 2 min | 100 | 3 (you asked for this) |
+
+`every-diff` exists for people who live in one long session and want the gate
+on practically every risky diff. The session cap stops mattering; the only
+brakes left are the risk threshold and the same-diff digest check. Saying
+"quizme" mid-session quizzes the latest diff on demand, any preset.
 
 Lower `fire_threshold` = smaller diffs qualify. Values are clamped to sane
 ranges and a corrupt config falls back to defaults, because a nagging tool
