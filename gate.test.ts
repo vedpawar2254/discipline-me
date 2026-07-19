@@ -920,8 +920,8 @@ describe("debt & exports", () => {
     expect(r.stdout).toContain("Not a git repo");
   });
 
-  test("statusline segment: streak + focus; empty on no data", () => {
-    expect(statuslineSegment([], ANCHOR)).toBe("");
+  test("statusline segment: streak always visible, focus when known", () => {
+    expect(statuslineSegment([], ANCHOR)).toBe("🔥0d"); // never invisible
     const gaps = [
       { ts: daysAgoIso(0, 10), sha: "a", file: "x.ts", score: 2, missed: "", skipped: false, concepts: ["regex"] },
       { ts: daysAgoIso(1, 10), sha: "b", file: "y.ts", score: 0, missed: "", skipped: false, concepts: ["regex"] },

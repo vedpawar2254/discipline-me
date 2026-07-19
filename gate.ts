@@ -856,8 +856,8 @@ export function statuslineSegment(gaps: GapEntry[], now: Date): string {
     }
     focus = worst?.id ?? null;
   }
-  const bits: string[] = [];
-  if (streak > 0) bits.push(`🔥${streak}d`);
+  // Always show the flame (even 🔥0d) — an invisible statusline reads as broken.
+  const bits: string[] = [`🔥${streak}d`];
   if (focus) bits.push(`▶ ${CONCEPTS.find((c) => c.id === focus)?.label ?? focus}`);
   return bits.join(" · ");
 }
