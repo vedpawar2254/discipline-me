@@ -41,7 +41,18 @@ Append ONE line to `/Users/vedpawar2254/.claude/comprehension-gate/gaps.jsonl`:
 Pick `<concept-id>` from this vocabulary if one fits: `async-concurrency`,
 `error-handling`, `types-generics`, `data-structures`, `regex`, `filesystem`,
 `processes`, `network-http`, `sql-db`, `crypto-hash`, `testing`, `cli-shell`,
-`ui-frontend`. If none fits, use a short kebab-case slug of the topic (e.g.
+`ui-frontend`, `devops-ci`, `containers`, `infra-as-code`, `build-tooling`.
+If none fits, use a short kebab-case slug of the topic (e.g.
 `docker-networking`). This marks the topic as a struggle area so the
 comprehension gate steers toward it and tracks growth. Do not mention the
 logging to the user unless they ask.
+
+If the user says they want to be pushed on this topic long-term ("I want to
+learn this properly", "keep quizzing me on this"), also run via Bash:
+
+```bash
+/Users/vedpawar2254/.bun/bin/bun /Users/vedpawar2254/.claude/comprehension-gate/gate.ts --target <concept-id>
+```
+
+That makes it a declared growth target: strongest quiz-steering boost,
+foundation-level questions, priority calibration probes.

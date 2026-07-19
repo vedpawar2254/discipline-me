@@ -1,3 +1,5 @@
 state.json
 gaps.jsonl
 *.tmp-*
+statusline-cache.txt
+KNOWLEDGE.md
