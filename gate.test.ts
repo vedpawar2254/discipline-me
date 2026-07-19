@@ -706,7 +706,11 @@ describe("infra vocab", () => {
     const parsed = JSON.parse(stdout);
     expect(parsed.decision).toBe("block");
     expect(parsed.reason).toContain("ci.yml");
-    expect(parsed.reason).toContain('"concepts":["devops-ci"');
+    // full prompt lives in the session prompt file, not the visible reason
+    const promptFile = readFileSync(join(sd, "gate-prompt-s1.md"), "utf8");
+    expect(promptFile).toContain('"concepts":["devops-ci"');
+    expect(parsed.reason).not.toContain("RETRIEVAL FIRST"); // terminal stays readable
+    expect(parsed.reason).toContain("gate-prompt-s1.md");
   });
 });
 

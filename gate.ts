@@ -17,7 +17,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 
@@ -1564,30 +1564,48 @@ async function main(): Promise<void> {
   const probe = chooseProbe(stats, now, top.concepts, targets);
   const difficulty = difficultyFor(top.concepts, classes, targets, stats);
 
-  // State write MUST precede the block decision: if we can't record the gate,
-  // we don't fire (a crash here must never double-fire).
+  const prompt = buildGatePrompt({
+    file: top.file,
+    hunk: top.text,
+    shortSha: d.headSha.slice(0, 8),
+    gapsPath: join(dir, "gaps.jsonl"),
+    scriptPath: import.meta.path,
+    bunPath: process.execPath,
+    concepts: top.concepts,
+    probe,
+    repo: repoNameFor(cwd),
+    via: "stop",
+    difficulty,
+  });
+
+  // The full prompt goes to a FILE, not the block reason: Claude Code renders
+  // the whole reason string in the terminal ("Stop hook error: …"), and a
+  // 50-line hunk plus rubric is unreadable there. The reason is a short
+  // pointer; Claude Reads the file (collapsed in the UI) and runs the gate.
+  const promptPath = join(dir, `gate-prompt-${sessionId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8) || "x"}.md`);
+
+  // State + prompt writes MUST precede the block decision: if we can't record
+  // the gate, we don't fire (a crash here must never double-fire).
   try {
     writeStateAtomic(dir, nextStateOnFire(state, sessionId, d.headSha, digest, now));
+    writeFileSync(promptPath, prompt);
   } catch {
     return;
   }
 
+  // best-effort: drop prompt files from sessions older than 7 days
+  try {
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith("gate-prompt-")) continue;
+      const p = join(dir, f);
+      if (p !== promptPath && now.getTime() - statSync(p).mtimeMs > 7 * 86400000) unlinkSync(p);
+    }
+  } catch {}
+
   process.stdout.write(
     JSON.stringify({
       decision: "block",
-      reason: buildGatePrompt({
-        file: top.file,
-        hunk: top.text,
-        shortSha: d.headSha.slice(0, 8),
-        gapsPath: join(dir, "gaps.jsonl"),
-        scriptPath: import.meta.path,
-        bunPath: process.execPath,
-        concepts: top.concepts,
-        probe,
-        repo: repoNameFor(cwd),
-        via: "stop",
-        difficulty,
-      }),
+      reason: `COMPREHENSION GATE — the user just accepted a risky diff (${top.file}). Before ending this turn, run a short comprehension check: use the Read tool on ${promptPath} and follow its instructions EXACTLY — retrieval question first; escape hatches ("skip" / "snooze" / "no clue" / "bad q") honored instantly. Do not print or summarize that file's contents — just conduct the gate.`,
     }),
   );
 }
