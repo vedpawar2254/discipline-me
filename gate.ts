@@ -190,7 +190,7 @@ const EXCLUDE_PATHSPECS = [
   ":(exclude)*.min.*",
   ":(exclude)*.d.ts",
   ":(exclude)*.generated.*",
-  ":(exclude)*node_modules/*",
+  ":(exclude)*node_modules*",
   ":(exclude)*dist/*",
   ":(exclude)*build/*",
   ":(exclude)*vendor/*",
@@ -202,7 +202,7 @@ const EXCLUDE_PATHSPECS = [
 export function isSourcePath(p: string): boolean {
   const ext = p.split(".").pop()?.toLowerCase() ?? "";
   if (!SOURCE_EXTS.includes(ext)) return false;
-  if (/(^|\/)(node_modules|dist|build|vendor)\//.test(p)) return false;
+  if (/(^|\/)(node_modules[^/]*|dist|build|vendor|\.git)\//.test(p)) return false; // node_modules.nosync too (iCloud)
   if (/\.min\.|\.d\.ts$|\.generated\./.test(p)) return false;
   const base = p.split("/").pop() ?? p;
   if (base.startsWith(".")) return false; // dotfiles: .eslintrc.js, .prettierrc.cjs, ...

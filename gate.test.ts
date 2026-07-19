@@ -232,6 +232,8 @@ describe("diff", () => {
     expect(isSourcePath("src/x.ts")).toBe(true);
     expect(isSourcePath("yarn.lock")).toBe(false);
     expect(isSourcePath("node_modules/x/y.js")).toBe(false);
+    expect(isSourcePath("admin/node_modules.nosync/@babel/core/lib/config.js")).toBe(false); // iCloud suffix
+    expect(isSourcePath(".git/hooks/pre-commit.sh")).toBe(false);
     expect(isSourcePath("dist/out.js")).toBe(false);
     expect(isSourcePath("types.d.ts")).toBe(false);
     expect(isSourcePath("app.min.js")).toBe(false);
