@@ -27,6 +27,7 @@ export interface GateState {
   last_sha: string | null;
   last_gated_digest: string | null;
   session_marker: string | null; // "gate ATTEMPTED this session" — not completed
+  session_count: number; // gates fired this session (for per_session > 1)
   daily_count: number;
   day: string | null; // local YYYY-MM-DD
   last_gate_ts: string | null; // ISO8601
@@ -37,15 +38,75 @@ export const DEFAULT_STATE: GateState = {
   last_sha: null,
   last_gated_digest: null,
   session_marker: null,
+  session_count: 0,
   daily_count: 0,
   day: null,
   last_gate_ts: null,
   snooze_until: null,
 };
 
-const DAILY_CAP = 3;
-const MIN_GAP_MS = 45 * 60 * 1000;
-const FIRE_THRESHOLD = 5;
+// ---------- config (strictness / frequency knobs) ----------
+// config.json in the state dir. Missing/corrupt → defaults; values clamped.
+// The gate must never break a stop because someone fat-fingered a number.
+
+export interface GateConfig {
+  daily_cap: number; // max gates per calendar day
+  min_gap_minutes: number; // minimum minutes between gates
+  per_session: number; // max gates per Claude session
+  fire_threshold: number; // risk score needed to fire (lower = stricter)
+}
+
+export const DEFAULT_CONFIG: GateConfig = {
+  daily_cap: 3,
+  min_gap_minutes: 45,
+  per_session: 1,
+  fire_threshold: 5,
+};
+
+export const PRESETS: Record<string, GateConfig> = {
+  chill: { daily_cap: 2, min_gap_minutes: 90, per_session: 1, fire_threshold: 8 },
+  default: { ...DEFAULT_CONFIG },
+  strict: { daily_cap: 6, min_gap_minutes: 20, per_session: 2, fire_threshold: 4 },
+  "drill-sergeant": { daily_cap: 12, min_gap_minutes: 10, per_session: 3, fire_threshold: 3 },
+};
+
+const CONFIG_CLAMPS: Record<keyof GateConfig, [number, number]> = {
+  daily_cap: [1, 50],
+  min_gap_minutes: [0, 720],
+  per_session: [1, 10],
+  fire_threshold: [1, 50],
+};
+
+export function clampConfigValue(key: keyof GateConfig, n: number): number {
+  const [lo, hi] = CONFIG_CLAMPS[key];
+  return Math.min(hi, Math.max(lo, Math.round(n)));
+}
+
+export function readConfig(dir: string): GateConfig {
+  let raw: string;
+  try {
+    raw = readFileSync(join(dir, "config.json"), "utf8");
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
+  try {
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
+    const out = { ...DEFAULT_CONFIG };
+    for (const key of Object.keys(CONFIG_CLAMPS) as (keyof GateConfig)[]) {
+      const n = (v as Record<string, unknown>)[key];
+      if (typeof n === "number" && Number.isFinite(n)) out[key] = clampConfigValue(key, n);
+    }
+    return out;
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+function writeConfig(dir: string, c: GateConfig): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "config.json"), JSON.stringify(c, null, 2) + "\n");
+}
 const MAX_HUNK_LINES = 50;
 const MAX_HUNK_CHARS = 4000;
 const MAX_UNTRACKED_FILES = 20;
@@ -66,7 +127,12 @@ export function readState(dir: string): { state: GateState; corrupt: boolean } {
   try {
     const v = JSON.parse(raw);
     if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
-    return { state: { ...DEFAULT_STATE, ...v }, corrupt: false };
+    const state: GateState = { ...DEFAULT_STATE, ...v };
+    // pre-session_count files: a set marker means one gate already fired this session
+    if (typeof (v as Record<string, unknown>).session_marker === "string" && (v as Record<string, unknown>).session_count === undefined) {
+      state.session_count = 1;
+    }
+    return { state, corrupt: false };
   } catch {
     return { state: { ...DEFAULT_STATE }, corrupt: true }; // corrupt → repair + allow
   }
@@ -171,13 +237,20 @@ export function quietHours(gaps: GapEntry[]): Set<number> {
 }
 
 // true = allow (governor suppresses the gate)
-export function governorAllows(state: GateState, sessionId: string, now: Date, quiet?: Set<number>): boolean {
+export function governorAllows(
+  state: GateState,
+  sessionId: string,
+  now: Date,
+  quiet?: Set<number>,
+  config?: GateConfig,
+): boolean {
+  const cfg = config ?? DEFAULT_CONFIG;
   if (quiet?.has(now.getHours())) return true; // learned quiet hour
-  if (state.session_marker === sessionId) return true; // once per session (attempted counts)
-  if (state.day === localDay(now) && state.daily_count >= DAILY_CAP) return true;
+  if (state.session_marker === sessionId && state.session_count >= cfg.per_session) return true; // session budget spent
+  if (state.day === localDay(now) && state.daily_count >= cfg.daily_cap) return true;
   if (state.last_gate_ts) {
     const t = Date.parse(state.last_gate_ts);
-    if (!Number.isNaN(t) && now.getTime() - t < MIN_GAP_MS) return true; // 45-min gap (future ts ⇒ allow, fail-quiet)
+    if (!Number.isNaN(t) && now.getTime() - t < cfg.min_gap_minutes * 60_000) return true; // gap (future ts ⇒ allow, fail-quiet)
   }
   if (state.snooze_until) {
     const t = Date.parse(state.snooze_until);
@@ -198,6 +271,7 @@ export function nextStateOnFire(
     last_sha: headSha,
     last_gated_digest: digest,
     session_marker: sessionId,
+    session_count: state.session_marker === sessionId ? state.session_count + 1 : 1,
     daily_count: state.day === today ? state.daily_count + 1 : 1,
     day: today,
     last_gate_ts: now.toISOString(),
@@ -1338,6 +1412,55 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (arg === "--config") {
+    const key = process.argv[3];
+    const val = process.argv[4];
+    const cfg = readConfig(dir);
+    const keys = Object.keys(DEFAULT_CONFIG) as (keyof GateConfig)[];
+    if (!key) {
+      for (const k of keys) {
+        const def = DEFAULT_CONFIG[k];
+        console.log(`${k} = ${cfg[k]}${cfg[k] === def ? " (default)" : ` (default ${def})`}`);
+      }
+      console.log(`Presets: ${Object.keys(PRESETS).join(", ")} — apply with: --config preset <name>`);
+      return;
+    }
+    if (key === "reset") {
+      writeConfig(dir, { ...DEFAULT_CONFIG });
+      console.log("Config reset to defaults.");
+      return;
+    }
+    if (key === "preset") {
+      const p = PRESETS[val ?? ""];
+      if (!p) {
+        console.log(`Unknown preset "${val ?? ""}". Presets: ${Object.keys(PRESETS).join(", ")}`);
+        return;
+      }
+      writeConfig(dir, { ...p });
+      console.log(
+        `Preset "${val}": ${keys.map((k) => `${k}=${p[k]}`).join(" · ")}`,
+      );
+      return;
+    }
+    if (!keys.includes(key as keyof GateConfig)) {
+      console.log(`Unknown key "${key}". Keys: ${keys.join(", ")}`);
+      return;
+    }
+    const k = key as keyof GateConfig;
+    if (val === undefined) {
+      console.log(`${k} = ${cfg[k]}`);
+      return;
+    }
+    const n = Number(val);
+    if (!Number.isFinite(n)) {
+      console.log(`"${val}" is not a number.`);
+      return;
+    }
+    const clamped = clampConfigValue(k, n);
+    writeConfig(dir, { ...cfg, [k]: clamped });
+    console.log(`${k} = ${clamped}${clamped !== Math.round(n) ? ` (clamped from ${val})` : ""}`);
+    return;
+  }
   if (arg === "--export-md") {
     const p = process.argv[3] ?? join(dir, "KNOWLEDGE.md");
     mkdirSync(dir, { recursive: true });
@@ -1415,7 +1538,8 @@ async function main(): Promise<void> {
 
   const now = new Date();
   const gaps = readGaps(dir);
-  if (governorAllows(state, sessionId, now, quietHours(gaps))) return;
+  const config = readConfig(dir);
+  if (governorAllows(state, sessionId, now, quietHours(gaps), config)) return;
 
   const d = getDiff(cwd, state.last_sha);
   if (!d || d.diff.trim() === "") return;
@@ -1433,7 +1557,7 @@ async function main(): Promise<void> {
     .filter((f) => isSourcePath(f.path)) // definitive filter (pathspecs are an optimization)
     .filter((f) => !badqSuppressed(badq.files, f.path, now));
   const { total, top } = scoreDiff(parsed, gated, classes, badq.concepts, targets);
-  if (total < FIRE_THRESHOLD || !top) return;
+  if (total < config.fire_threshold || !top) return;
   const probe = chooseProbe(stats, now, top.concepts, targets);
   const difficulty = difficultyFor(top.concepts, classes, targets, stats);
 

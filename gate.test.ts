@@ -6,11 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CONCEPTS,
+  DEFAULT_CONFIG,
   DEFAULT_STATE,
   type ConceptClass,
   type ConceptStat,
   type GateState,
   activeTargets,
+  readConfig,
   applyConceptSteering,
   badqData,
   badqSuppressed,
@@ -340,9 +342,9 @@ describe("scorer", () => {
 describe("governor", () => {
   const now = ANCHOR;
 
-  test("same session marker → allow", () => {
-    expect(governorAllows({ ...DEFAULT_STATE, session_marker: "s1" }, "s1", now)).toBe(true);
-    expect(governorAllows({ ...DEFAULT_STATE, session_marker: "s1" }, "s2", now)).toBe(false);
+  test("same session marker with spent budget → allow", () => {
+    expect(governorAllows({ ...DEFAULT_STATE, session_marker: "s1", session_count: 1 }, "s1", now)).toBe(true);
+    expect(governorAllows({ ...DEFAULT_STATE, session_marker: "s1", session_count: 1 }, "s2", now)).toBe(false);
   });
 
   test("daily cap of 3 → allow; day rollover resets", () => {
@@ -1030,6 +1032,15 @@ describe("quiz", () => {
     expect(out).toContain("src/risky.ts");
   });
 
+  test("config-driven quiz unaffected by governor knobs", () => {
+    // sanity anchor for group 18: quiz already bypasses governor regardless of config
+    const { repo } = initRepo();
+    const sd = td();
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ daily_cap: 1 }));
+    writeFileSync(join(repo, "risky.ts"), RISKY);
+    expect(runQuiz(repo, sd, "risky.ts")).toContain("COMPREHENSION GATE");
+  });
+
   test("degenerate inputs get friendly messages", () => {
     const { repo } = initRepo();
     const sd = td();
@@ -1041,5 +1052,90 @@ describe("quiz", () => {
     writeFileSync(join(repo, "deps.lock"), "x");
     expect(runQuiz(repo, sd, "deps.lock")).toContain("not a quizzable");
     expect(runQuiz(repo, sd)).toContain("Nothing to quiz"); // clean tree, single commit → no diff
+  });
+});
+
+// ---------- Group 18: config (strictness / frequency) ----------
+
+describe("config", () => {
+  test("readConfig: missing → defaults; partial merges; clamps; corrupt → defaults", () => {
+    expect(readConfig(td())).toEqual(DEFAULT_CONFIG);
+    const sd = td();
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ daily_cap: 10 }));
+    expect(readConfig(sd)).toEqual({ ...DEFAULT_CONFIG, daily_cap: 10 });
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ daily_cap: 999, min_gap_minutes: -5, per_session: 2.7 }));
+    const c = readConfig(sd);
+    expect(c.daily_cap).toBe(50);
+    expect(c.min_gap_minutes).toBe(0);
+    expect(c.per_session).toBe(3);
+    writeFileSync(join(sd, "config.json"), "{{{ nope");
+    expect(readConfig(sd)).toEqual(DEFAULT_CONFIG);
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ daily_cap: "lots" }));
+    expect(readConfig(sd)).toEqual(DEFAULT_CONFIG); // wrong type ignored
+  });
+
+  test("governor honors custom caps, gap, and per-session budget", () => {
+    const now = ANCHOR;
+    const cfg = { ...DEFAULT_CONFIG, daily_cap: 6, min_gap_minutes: 10, per_session: 2 };
+    const capped = { ...DEFAULT_STATE, daily_count: 3, day: localDay(now) };
+    expect(governorAllows(capped, "s2", now, undefined, cfg)).toBe(false); // 3 < 6 now fine
+    expect(governorAllows({ ...capped, daily_count: 6 }, "s2", now, undefined, cfg)).toBe(true);
+    const gap15 = { ...DEFAULT_STATE, last_gate_ts: new Date(now.getTime() - 15 * 60_000).toISOString() };
+    expect(governorAllows(gap15, "s2", now, undefined, cfg)).toBe(false); // 15min > 10min gap
+    expect(governorAllows(gap15, "s2", now)).toBe(true); // default 45min still blocks
+    const oneFired = { ...DEFAULT_STATE, session_marker: "s1", session_count: 1 };
+    expect(governorAllows(oneFired, "s1", now, undefined, cfg)).toBe(false); // budget of 2, 1 spent
+    expect(governorAllows({ ...oneFired, session_count: 2 }, "s1", now, undefined, cfg)).toBe(true);
+    expect(governorAllows(oneFired, "s1", now)).toBe(true); // default per_session 1
+  });
+
+  test("nextStateOnFire counts per-session; readState back-fills old files", () => {
+    const first = nextStateOnFire({ ...DEFAULT_STATE }, "s1", "sha", "d1", ANCHOR);
+    expect(first.session_count).toBe(1);
+    const second = nextStateOnFire(first, "s1", "sha", "d2", ANCHOR);
+    expect(second.session_count).toBe(2);
+    const newSession = nextStateOnFire(second, "s2", "sha", "d3", ANCHOR);
+    expect(newSession.session_count).toBe(1);
+    const sd = td();
+    writeFileSync(join(sd, "state.json"), JSON.stringify({ session_marker: "old" })); // pre-upgrade file
+    expect(readState(sd).state.session_count).toBe(1);
+  });
+
+  test("per_session 2 + zero gap allows a second gate in the same session (end-to-end)", () => {
+    const { repo, sha } = initRepo();
+    const sd = td();
+    seedState(sd, { last_sha: sha });
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ per_session: 2, min_gap_minutes: 0 }));
+    writeFileSync(join(repo, "risky.ts"), RISKY);
+    expectBlock(runGate(baseInput(repo, "s1"), sd).stdout);
+    appendFileSync(join(repo, "risky.ts"), "export function extra(n: number) {\n  if (n) { return n; }\n  return 0;\n}\n");
+    expectBlock(runGate(baseInput(repo, "s1"), sd).stdout); // second gate, same session
+    appendFileSync(join(repo, "risky.ts"), "export function extra2(n: number) {\n  if (n) { return n; }\n  return 0;\n}\n");
+    expect(runGate(baseInput(repo, "s1"), sd).stdout).toBe(""); // budget of 2 spent
+  });
+
+  test("fire_threshold from config gates the scorer (end-to-end)", () => {
+    const { repo, sha } = initRepo();
+    const sd = td();
+    seedState(sd, { last_sha: sha });
+    writeFileSync(join(sd, "config.json"), JSON.stringify({ fire_threshold: 50 }));
+    writeFileSync(join(repo, "risky.ts"), RISKY); // scores well above 5, below 50
+    expect(runGate(baseInput(repo), sd).stdout).toBe("");
+  });
+
+  test("--config CLI: list, set, clamp note, preset, reset, unknown key", () => {
+    const sd = td();
+    expect(runCli(["--config"], sd)).toContain("daily_cap = 3 (default)");
+    expect(runCli(["--config", "daily_cap", "8"], sd)).toContain("daily_cap = 8");
+    expect(runCli(["--config"], sd)).toContain("daily_cap = 8 (default 3)");
+    expect(runCli(["--config", "daily_cap"], sd)).toBe("daily_cap = 8");
+    expect(runCli(["--config", "min_gap_minutes", "9999"], sd)).toContain("clamped");
+    expect(runCli(["--config", "nonsense", "1"], sd)).toContain("Unknown key");
+    expect(runCli(["--config", "daily_cap", "many"], sd)).toContain("not a number");
+    expect(runCli(["--config", "preset", "drill-sergeant"], sd)).toContain("daily_cap=12");
+    expect(readConfig(sd).min_gap_minutes).toBe(10);
+    expect(runCli(["--config", "preset", "nope"], sd)).toContain("Unknown preset");
+    expect(runCli(["--config", "reset"], sd)).toContain("reset");
+    expect(readConfig(sd)).toEqual(DEFAULT_CONFIG);
   });
 });
