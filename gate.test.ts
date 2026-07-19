@@ -5,15 +5,25 @@ import { chmodSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, appen
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CONCEPTS,
   DEFAULT_STATE,
+  type ConceptClass,
   type GateState,
+  badqData,
+  badqSuppressed,
+  buildGatePrompt,
+  chooseProbe,
+  classifyConcept,
   computeStatus,
+  conceptStats,
+  detectConcepts,
   governorAllows,
   guardsAllow,
   isSourcePath,
   localDay,
   nextStateOnFire,
   parseDiff,
+  progressReport,
   readGaps,
   readState,
   scoreDiff,
@@ -462,5 +472,181 @@ describe("streak", () => {
     expect(state.snooze_until).toBeTruthy();
     expect(Date.parse(state.snooze_until as string)).toBeGreaterThan(Date.now());
     expect(state.session_marker).toBe("keep-me"); // rest of state preserved
+  });
+});
+
+// ---------- Group 8: concept model ----------
+
+function gateLine(daysAgo: number, file: string, score: number | null, concepts: string[], skipped = false) {
+  return { ts: daysAgoIso(daysAgo), sha: "abc", file, score, missed: "", skipped, concepts };
+}
+
+describe("concepts", () => {
+  test("detectConcepts tags by content and extension", () => {
+    expect(detectConcepts(["try { x(); } catch (e) { throw e; }"], "a.ts")).toContain("error-handling");
+    expect(detectConcepts(["const r = await fetch(url);"], "a.ts")).toEqual(
+      expect.arrayContaining(["async-concurrency", "network-http"]),
+    );
+    expect(detectConcepts(["const x = 1;"], "style.css")).toContain("ui-frontend");
+    expect(detectConcepts(["const x = 1;"], "a.ts")).toEqual([]);
+  });
+
+  test("conceptStats aggregates scores and self entries; old lines without concepts ignored", () => {
+    const gaps = [
+      gateLine(3, "x.ts", 0, ["regex"]),
+      gateLine(2, "y.ts", 1, ["regex", "error-handling"]),
+      { ts: daysAgoIso(1), sha: "z", file: "z.ts", score: 2, missed: "", skipped: false }, // pre-concepts line
+      { type: "self", ts: daysAgoIso(1), concept: "processes", comfort: 2 },
+    ];
+    const stats = conceptStats(gaps);
+    expect(stats.get("regex")?.attempts).toBe(2);
+    expect(stats.get("regex")?.avg).toBe(0.5);
+    expect(stats.get("error-handling")?.attempts).toBe(1);
+    expect(stats.get("processes")?.lastComfort).toBe(2);
+  });
+
+  test("classifyConcept: struggling / strength / growing / self-report override", () => {
+    expect(classifyConcept({ attempts: 2, avg: 0.5, recentAvg: 0.5, prevAvg: null, lastComfort: null, lastSelfTs: null })).toBe("struggling");
+    expect(classifyConcept({ attempts: 4, avg: 1.75, recentAvg: 2, prevAvg: 1, lastComfort: null, lastSelfTs: null })).toBe("strength");
+    expect(classifyConcept({ attempts: 5, avg: 1.2, recentAvg: 1.7, prevAvg: 1.0, lastComfort: null, lastSelfTs: null })).toBe("growing");
+    expect(classifyConcept({ attempts: 4, avg: 1.8, recentAvg: 2, prevAvg: 1.5, lastComfort: 2, lastSelfTs: daysAgoIso(1) })).toBe("struggling"); // self-report wins
+  });
+
+  test("chooseProbe: prefers hunk concept, respects 7-day cooldown, max one", () => {
+    const struggling = (lastSelfTs: string | null) => ({
+      attempts: 2, avg: 0.5, recentAvg: 0.5, prevAvg: null, lastComfort: null, lastSelfTs,
+    });
+    const stats = new Map([
+      ["regex", struggling(null)],
+      ["processes", struggling(null)],
+    ]);
+    expect(chooseProbe(stats, ANCHOR, ["processes"])?.id).toBe("processes"); // in-hunk preferred
+    expect(chooseProbe(stats, ANCHOR, [])?.id).toBe("processes"); // tie → lexicographic
+    const cooled = new Map([["regex", struggling(daysAgoIso(2))]]);
+    expect(chooseProbe(cooled, ANCHOR, ["regex"])).toBeNull(); // probed 2 days ago
+    const expired = new Map([["regex", struggling(daysAgoIso(8))]]);
+    expect(chooseProbe(expired, ANCHOR, ["regex"])?.id).toBe("regex"); // cooldown over
+  });
+
+  test("scorer: struggling concept boosts +2, all-strength reduces", () => {
+    const classes = (c: ConceptClass) => new Map<string, ConceptClass>([["error-handling", c]]);
+    const hunkDiff = `diff --git a/x.ts b/x.ts\nindex 1..2 100644\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n+try { risky(); } catch (e) { throw e; }\n`;
+    const neutral = scoreDiff(parseDiff(hunkDiff), new Set(["x.ts"]));
+    const boosted = scoreDiff(parseDiff(hunkDiff), new Set(["x.ts"]), classes("struggling"));
+    const reduced = scoreDiff(parseDiff(hunkDiff), new Set(["x.ts"]), classes("strength"));
+    expect(boosted.total - neutral.total).toBe(2);
+    expect(neutral.total - reduced.total).toBe(2);
+    expect(neutral.top?.concepts).toContain("error-handling");
+  });
+
+  test("gate prompt embeds concepts, quality rule, no-clue hatch; probe step only when given", () => {
+    const args = {
+      file: "x.ts", hunk: "@@ +1 @@\n+try {} catch {}", shortSha: "abcd1234",
+      gapsPath: "/g/gaps.jsonl", scriptPath: "/g/gate.ts", bunPath: "/bin/bun",
+      concepts: ["error-handling"], probe: null,
+    };
+    const without = buildGatePrompt(args);
+    expect(without).toContain('"concepts":["error-handling"]');
+    expect(without).toContain("QUESTION QUALITY RULE");
+    expect(without).toContain('"no clue"');
+    expect(without).toContain("--bad-q");
+    expect(without).not.toContain("CALIBRATION");
+    const withProbe = buildGatePrompt({ ...args, probe: { id: "regex", label: "regular expressions" } });
+    expect(withProbe).toContain("CALIBRATION");
+    expect(withProbe).toContain('"concept":"regex"');
+  });
+});
+
+// ---------- Group 9: bad-question training ----------
+
+describe("badq", () => {
+  test("badqData: file map + concepts flagged twice", () => {
+    const gaps = [
+      { type: "badq", ts: daysAgoIso(1), file: "x.ts", concepts: ["regex"] },
+      { type: "badq", ts: daysAgoIso(0), file: "y.ts", concepts: ["regex", "testing"] },
+    ];
+    const { files, concepts } = badqData(gaps);
+    expect(files.get("x.ts")).toBeTruthy();
+    expect(concepts.has("regex")).toBe(true); // flagged 2×
+    expect(concepts.has("testing")).toBe(false); // only 1×
+  });
+
+  test("badqSuppressed: 14-day window", () => {
+    const files = new Map([
+      ["recent.ts", daysAgoIso(3)],
+      ["old.ts", daysAgoIso(20)],
+    ]);
+    expect(badqSuppressed(files, "recent.ts", ANCHOR)).toBe(true);
+    expect(badqSuppressed(files, "old.ts", ANCHOR)).toBe(false);
+    expect(badqSuppressed(files, "never.ts", ANCHOR)).toBe(false);
+  });
+
+  test("badq'd concept loses boost (-2 vs neutral)", () => {
+    const hunkDiff = `diff --git a/x.ts b/x.ts\nindex 1..2 100644\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n+try { risky(); } catch (e) { throw e; }\n`;
+    const neutral = scoreDiff(parseDiff(hunkDiff), new Set(["x.ts"]));
+    const flagged = scoreDiff(parseDiff(hunkDiff), new Set(["x.ts"]), undefined, new Set(["error-handling"]));
+    expect(neutral.total - flagged.total).toBe(2);
+  });
+
+  test("--bad-q CLI flags last gate entry (end-to-end)", () => {
+    const sd = td();
+    writeFileSync(
+      join(sd, "gaps.jsonl"),
+      JSON.stringify(gateLine(0, "x.ts", 2, ["regex"])) + "\n",
+    );
+    expect(runCli(["--bad-q", "config", "trivia"], sd)).toContain("x.ts");
+    const gaps = readGaps(sd);
+    expect(gaps.length).toBe(2);
+    expect(gaps[1].type).toBe("badq");
+    expect(gaps[1].file).toBe("x.ts");
+    expect(gaps[1].concepts).toEqual(["regex"]);
+  });
+
+  test("--bad-q with empty log says so (end-to-end)", () => {
+    expect(runCli(["--bad-q"], td())).toContain("No gate on record");
+  });
+
+  test("config-ish files excluded from targeting (unit)", () => {
+    expect(isSourcePath("vite.config.ts")).toBe(false);
+    expect(isSourcePath(".eslintrc.js")).toBe(false);
+    expect(isSourcePath("src/.prettierrc.cjs")).toBe(false);
+    expect(isSourcePath("config/database.ts")).toBe(false);
+    expect(isSourcePath("src/commands.ts")).toBe(true);
+  });
+});
+
+// ---------- Group 10: progress report ----------
+
+describe("progress", () => {
+  test("report groups strengths / growing / pushing-against / unseen", () => {
+    const gaps = [
+      gateLine(5, "a.ts", 2, ["error-handling"]),
+      gateLine(4, "b.ts", 2, ["error-handling"]),
+      gateLine(3, "c.ts", 2, ["error-handling"]),
+      gateLine(2, "d.ts", 0, ["regex"]),
+      gateLine(1, "e.ts", 0, ["regex"]),
+      gateLine(0, "f.ts", null, ["testing"], true), // skip — excluded from stats
+    ];
+    const report = progressReport(gaps, ANCHOR);
+    expect(report).toContain("6 gates (5 completed, 1 skipped)");
+    expect(report).toContain("pass 60%");
+    expect(report).toContain("Strengths: error handling (2.0 avg, 3×)");
+    expect(report).toContain("Pushing against: regular expressions (0.0 avg, 2×)");
+    expect(report).toContain("Not yet seen:");
+    expect(report).not.toContain("testing (");
+  });
+
+  test("--progress CLI (end-to-end)", () => {
+    const sd = td();
+    writeFileSync(
+      join(sd, "gaps.jsonl"),
+      [gateLine(1, "a.ts", 0, ["regex"]), gateLine(0, "b.ts", 0, ["regex"])].map((l) => JSON.stringify(l)).join("\n") + "\n",
+    );
+    const out = runCli(["--progress"], sd);
+    expect(out).toContain("Pushing against: regular expressions");
+  });
+
+  test("empty log → n/a pass rate, no crash", () => {
+    expect(progressReport([], ANCHOR)).toContain("pass n/a");
   });
 });
