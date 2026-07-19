@@ -3,3 +3,4 @@ gaps.jsonl
 *.tmp-*
 statusline-cache.txt
 KNOWLEDGE.md
+config.json

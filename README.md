@@ -13,9 +13,11 @@ AI-assisted devs score 17% lower on comprehension of their own code. The
 protective factor was asking *why* instead of delegating wholesale. This tool
 makes the asking non-optional. You're welcome, or possibly I'm sorry.
 
-It is also polite about it. Once per session, three times a day max, 45
-minutes apart, never in plan mode, never on config trivia. It's a gate, not a
-roommate.
+It is also polite about it, to a degree you control. Out of the box: once per
+session, three times a day, 45 minutes apart, never in plan mode, never on
+config trivia. Too soft? `gate --config preset strict`. Feeling ambitious?
+There's a `drill-sergeant` preset, and it means it. It's a gate, not a
+roommate — but the lease terms are yours.
 
 ## During a gate — say any of these
 
@@ -83,7 +85,24 @@ gate --export-md           # KNOWLEDGE.md: strengths with receipts, weekly curve
 gate --statusline          # compact segment for the statusline (60s cache)
 gate --bad-q               # flag the last gate as a bad question
 gate --snooze              # no gates until local midnight
+gate --config              # show strictness/frequency knobs
+gate --config daily_cap 8  # set one knob (also: min_gap_minutes, per_session, fire_threshold)
+gate --config preset strict  # chill · default · strict · drill-sergeant
+gate --config reset        # back to defaults
 ```
+
+The presets, for calibration:
+
+| Preset | Gates/day | Min gap | Per session | Fire threshold |
+|--------|-----------|---------|-------------|----------------|
+| `chill` | 2 | 90 min | 1 | 8 (only big stuff) |
+| `default` | 3 | 45 min | 1 | 5 |
+| `strict` | 6 | 20 min | 2 | 4 |
+| `drill-sergeant` | 12 | 10 min | 3 | 3 (almost everything) |
+
+Lower `fire_threshold` = smaller diffs qualify. Values are clamped to sane
+ranges and a corrupt config falls back to defaults, because a nagging tool
+that crashes your editor teaches you nothing except regret.
 
 (`gate` being `alias gate='bun ~/.claude/comprehension-gate/gate.ts'`.
 Add it, you'll type these more than you think.)
