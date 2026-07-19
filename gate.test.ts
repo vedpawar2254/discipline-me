@@ -8,7 +8,10 @@ import {
   CONCEPTS,
   DEFAULT_STATE,
   type ConceptClass,
+  type ConceptStat,
   type GateState,
+  activeTargets,
+  applyConceptSteering,
   badqData,
   badqSuppressed,
   buildGatePrompt,
@@ -16,17 +19,26 @@ import {
   classifyConcept,
   computeStatus,
   conceptStats,
+  debtWeight,
   detectConcepts,
+  difficultyFor,
+  drillDown,
   governorAllows,
   guardsAllow,
+  isInfraPath,
   isSourcePath,
+  isoWeek,
+  knowledgePage,
   localDay,
   nextStateOnFire,
   parseDiff,
   progressReport,
+  quietHours,
   readGaps,
   readState,
+  riskiestWindow,
   scoreDiff,
+  statuslineSegment,
   writeStateAtomic,
 } from "./gate.ts";
 
@@ -650,5 +662,384 @@ describe("progress", () => {
 
   test("empty log → n/a pass rate, no crash", () => {
     expect(progressReport([], ANCHOR)).toContain("pass n/a");
+  });
+});
+
+// ---------- Group 11: infra vocabulary ----------
+
+describe("infra vocab", () => {
+  test("infra paths pass isSourcePath; generic yaml/config stays out", () => {
+    expect(isSourcePath(".github/workflows/ci.yml")).toBe(true);
+    expect(isSourcePath("app/.github/workflows/deploy.yaml")).toBe(true);
+    expect(isSourcePath("Dockerfile")).toBe(true);
+    expect(isSourcePath("services/api/Dockerfile.prod")).toBe(true);
+    expect(isSourcePath("docker-compose.override.yml")).toBe(true);
+    expect(isSourcePath("infra/main.tf")).toBe(true);
+    expect(isSourcePath("Makefile")).toBe(true);
+    expect(isSourcePath("values.yaml")).toBe(false); // generic yaml excluded
+    expect(isSourcePath("k8s/deployment.yaml")).toBe(false);
+    expect(isSourcePath("node_modules/pkg/Dockerfile")).toBe(false); // vendored infra excluded
+    expect(isInfraPath(".github/workflows/ci.yml")).toBe(true);
+  });
+
+  test("infra concepts detected by path and content", () => {
+    expect(detectConcepts(["jobs:", "  build:", "    runs-on: ubuntu-latest"], ".github/workflows/ci.yml")).toContain("devops-ci");
+    expect(detectConcepts(["FROM node:20", "RUN npm ci"], "Dockerfile")).toContain("containers");
+    expect(detectConcepts(['resource "aws_s3_bucket" "b" {'], "main.tf")).toContain("infra-as-code");
+    expect(detectConcepts(["anything"], "Makefile")).toContain("build-tooling");
+  });
+
+  test("workflow edit fires the gate end-to-end with devops-ci tagged", () => {
+    const { repo, sha } = initRepo();
+    const sd = td();
+    seedState(sd, { last_sha: sha });
+    // untracked workflow file — heavy CI content to clear the threshold
+    const wfDir = join(repo, ".github", "workflows");
+    spawnSync("mkdir", ["-p", wfDir]);
+    writeFileSync(
+      join(wfDir, "ci.yml"),
+      "name: ci\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: if [ -f bun.lock ]; then bun test; fi\n      - run: for f in *.ts; do echo $f; done\n",
+    );
+    const { stdout } = runGate(baseInput(repo), sd);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.decision).toBe("block");
+    expect(parsed.reason).toContain("ci.yml");
+    expect(parsed.reason).toContain('"concepts":["devops-ci"');
+  });
+});
+
+// ---------- Group 12: growth targets ----------
+
+describe("targets", () => {
+  test("activeTargets replays on/off events, last wins", () => {
+    const gaps = [
+      { type: "target", ts: daysAgoIso(3), concept: "devops-ci", on: true },
+      { type: "target", ts: daysAgoIso(2), concept: "regex", on: true },
+      { type: "target", ts: daysAgoIso(1), concept: "devops-ci", on: false },
+      { type: "target", ts: daysAgoIso(0), concept: "devops-ci", on: true },
+    ];
+    expect([...activeTargets(gaps)].sort()).toEqual(["devops-ci", "regex"]);
+  });
+
+  test("steering: target +3, struggling +2 (non-stacking), badq −2 overrides target", () => {
+    const classes = new Map<string, ConceptClass>([["regex", "struggling"]]);
+    const targets = new Set(["regex"]);
+    expect(applyConceptSteering(5, ["regex"], classes, targets)).toBe(8); // target wins, no stack
+    expect(applyConceptSteering(5, ["regex"], classes)).toBe(7); // struggling alone
+    expect(applyConceptSteering(5, ["regex"], classes, targets, new Set(["regex"]))).toBe(3); // badq overrides
+    expect(applyConceptSteering(5, [], classes, targets)).toBe(5); // no concepts, no steer
+  });
+
+  test("probe: targeted concept with zero attempts is eligible, targeted-in-hunk outranks struggling", () => {
+    const struggling: ConceptStat = { attempts: 2, avg: 0.5, recentAvg: 0.5, prevAvg: null, lastComfort: null, lastSelfTs: null };
+    const stats = new Map([["regex", struggling]]);
+    const targets = new Set(["devops-ci"]);
+    expect(chooseProbe(stats, ANCHOR, ["devops-ci", "regex"], targets)?.id).toBe("devops-ci");
+    expect(chooseProbe(new Map(), ANCHOR, [], targets)?.id).toBe("devops-ci"); // no stats at all
+  });
+
+  test("--target / --untarget CLI lifecycle (end-to-end)", () => {
+    const sd = td();
+    expect(runCli(["--target"], sd)).toContain("No growth targets");
+    expect(runCli(["--target", "Bad_ID!"], sd)).toContain("Invalid concept id");
+    expect(runCli(["--target", "devops-ci"], sd)).toContain("Growth target added");
+    expect(runCli(["--target", "devops-ci"], sd)).toContain("already");
+    expect(runCli(["--target"], sd)).toContain("devops-ci");
+    expect(runCli(["--untarget", "regex"], sd)).toContain("not a growth target");
+    expect(runCli(["--untarget", "devops-ci"], sd)).toContain("removed");
+    expect(runCli(["--target"], sd)).toContain("No growth targets");
+  });
+});
+
+// ---------- Group 13: auto-difficulty ----------
+
+describe("difficulty", () => {
+  const S = (attempts: number, avg: number): ConceptStat => ({
+    attempts, avg, recentAvg: avg, prevAvg: null, lastComfort: null, lastSelfTs: null,
+  });
+
+  test("truth table", () => {
+    const none = new Map<string, ConceptClass>();
+    const noT = new Set<string>();
+    const noS = new Map<string, ConceptStat>();
+    expect(difficultyFor([], none, noT, noS)).toBe("standard"); // no concepts
+    expect(difficultyFor(["regex"], new Map([["regex", "struggling" as ConceptClass]]), noT, noS)).toBe("foundation");
+    expect(difficultyFor(["regex"], none, new Set(["regex"]), noS)).toBe("foundation"); // targeted, 0 attempts
+    expect(difficultyFor(["regex"], new Map([["regex", "strength" as ConceptClass]]), new Set(["regex"]), new Map([["regex", S(5, 2)]]))).toBe("mastery"); // targeted but proven
+    expect(
+      difficultyFor(
+        ["regex", "testing"],
+        new Map<string, ConceptClass>([["regex", "strength"], ["testing", "learning"]]),
+        noT,
+        noS,
+      ),
+    ).toBe("standard"); // mixed
+    expect(
+      difficultyFor(["regex"], new Map([["regex", "strength" as ConceptClass]]), noT, noS),
+    ).toBe("mastery");
+  });
+
+  test("prompt carries the difficulty directive", () => {
+    const args = {
+      file: "x.ts", hunk: "@@ +1 @@\n+x", shortSha: "abcd1234",
+      gapsPath: "/g/gaps.jsonl", scriptPath: "/g/gate.ts", bunPath: "/bin/bun",
+      concepts: ["regex"], probe: null,
+    };
+    expect(buildGatePrompt({ ...args, difficulty: "foundation" })).toContain("DIFFICULTY: FOUNDATION");
+    expect(buildGatePrompt({ ...args, difficulty: "mastery" })).toContain("what breaks if");
+    expect(buildGatePrompt({ ...args, difficulty: "standard" })).not.toContain("DIFFICULTY:");
+    expect(buildGatePrompt(args)).toContain("load-bearing"); // quality rule upgrade
+  });
+
+  test("prompt log line carries repo and via", () => {
+    const p = buildGatePrompt({
+      file: "x.ts", hunk: "h", shortSha: "abcd1234", gapsPath: "/g/gaps.jsonl",
+      scriptPath: "/g/gate.ts", bunPath: "/bin/bun", concepts: [], probe: null,
+      repo: "myrepo", via: "quiz",
+    });
+    expect(p).toContain('"repo":"myrepo","via":"quiz"');
+  });
+});
+
+// ---------- Group 14: quiet hours ----------
+
+describe("quiet hours", () => {
+  const at = (daysAgo: number, hour: number, skipped: boolean, via?: string) => ({
+    ts: daysAgoIso(daysAgo, hour), sha: "a", file: "x.ts", score: skipped ? null : 2,
+    missed: "", skipped, concepts: [], ...(via ? { via } : {}),
+  });
+
+  test("3+ entries at 75%+ skip rate marks the hour quiet; quiz skips excluded", () => {
+    expect(quietHours([at(1, 23, true), at(2, 23, true)]).has(23)).toBe(false); // only 2 samples
+    expect(quietHours([at(1, 23, true), at(2, 23, true), at(3, 23, true)]).has(23)).toBe(true);
+    expect(quietHours([at(1, 23, true), at(2, 23, true), at(3, 23, true), at(4, 23, false)]).has(23)).toBe(true); // 3/4
+    expect(
+      quietHours([at(1, 23, true), at(2, 23, true), at(3, 23, false), at(4, 23, false)]).has(23),
+    ).toBe(false); // 50%
+    expect(
+      quietHours([at(1, 23, true, "quiz"), at(2, 23, true, "quiz"), at(3, 23, true, "quiz")]).has(23),
+    ).toBe(false); // quiz-only never teaches quiet
+  });
+
+  test("governor honors quiet hours", () => {
+    const quiet = new Set([ANCHOR.getHours()]);
+    expect(governorAllows({ ...DEFAULT_STATE }, "s1", ANCHOR, quiet)).toBe(true);
+    expect(governorAllows({ ...DEFAULT_STATE }, "s1", ANCHOR, new Set())).toBe(false);
+  });
+
+  test("progress report surfaces quiet hours", () => {
+    const gaps = [at(1, 23, true), at(2, 23, true), at(3, 23, true)];
+    expect(progressReport(gaps, ANCHOR)).toContain("Quiet hours");
+    expect(progressReport(gaps, ANCHOR)).toContain("23:00");
+  });
+});
+
+// ---------- Group 15: drill-down + repo profile ----------
+
+describe("drill-down & repo", () => {
+  const entry = (daysAgo: number, file: string, score: number, repo: string, missed = "") => ({
+    ts: daysAgoIso(daysAgo), sha: "a", file, score, missed, skipped: false, concepts: ["regex"], repo,
+  });
+
+  test("drill-down shows class, trend, entries; unknown concept lists vocabulary", () => {
+    const gaps = [
+      entry(2, "a.ts", 0, "repo-a", "greedy quantifier"),
+      entry(1, "b.ts", 1, "repo-b"),
+      { type: "self", ts: daysAgoIso(0), concept: "regex", comfort: 2 },
+    ];
+    const out = drillDown(gaps, "regex");
+    expect(out).toContain("regular expressions");
+    expect(out).toContain("class: struggling");
+    expect(out).toContain("Trend: ▁▄");
+    expect(out).toContain("repo-a · a.ts · 0/2 · missed: greedy quantifier");
+    expect(out).toContain("self-rating 2/5");
+    expect(drillDown(gaps, "nonexistent-thing")).toContain("Vocabulary:");
+  });
+
+  test("drill-down resolves by label and marks growth targets", () => {
+    const gaps = [
+      entry(1, "a.ts", 2, "r"),
+      { type: "target", ts: daysAgoIso(0), concept: "regex", on: true },
+    ];
+    expect(drillDown(gaps, "regular expressions")).toContain("GROWTH TARGET");
+  });
+
+  test("--progress --repo filters; global report lists repos", () => {
+    const gaps = [entry(2, "a.ts", 2, "repo-a"), entry(1, "b.ts", 0, "repo-b")];
+    const global = progressReport(gaps, ANCHOR);
+    expect(global).toContain("Repos:");
+    expect(global).toContain("repo-a (1, pass 100%)");
+    const scoped = progressReport(gaps, ANCHOR, "repo-a");
+    expect(scoped).toContain("[repo: repo-a]");
+    expect(scoped).toContain("1 gates");
+    expect(scoped).not.toContain("Repos:");
+  });
+
+  test("progress shows growth targets with and without data", () => {
+    const gaps = [
+      entry(1, "a.ts", 1, "r"),
+      { type: "target", ts: daysAgoIso(0), concept: "regex", on: true },
+      { type: "target", ts: daysAgoIso(0), concept: "devops-ci", on: true },
+    ];
+    const out = progressReport(gaps, ANCHOR);
+    expect(out).toContain("Growth targets:");
+    expect(out).toContain("regular expressions (1.0 avg, 1×)");
+    expect(out).toContain("CI/CD & workflows (no data yet)");
+  });
+});
+
+// ---------- Group 16: debt + statusline + knowledge page ----------
+
+describe("debt & exports", () => {
+  test("debtWeight decay boundaries", () => {
+    expect(debtWeight(daysAgoIso(10), ANCHOR)).toBe(1);
+    expect(debtWeight(daysAgoIso(60), ANCHOR)).toBe(0.5);
+    expect(debtWeight(daysAgoIso(120), ANCHOR)).toBe(0);
+    expect(debtWeight("garbage", ANCHOR)).toBe(0);
+  });
+
+  test("--debt end-to-end: coverage per dir, stale marking", () => {
+    const { repo } = initRepo(); // has a.ts tracked, repo name = basename
+    const repoName = repo.split("/").pop() as string;
+    const sd = td();
+    writeFileSync(
+      join(sd, "gaps.jsonl"),
+      JSON.stringify({ ts: daysAgoIso(0), sha: "x", file: "a.ts", score: 2, missed: "", skipped: false, concepts: [], repo: repoName }) + "\n",
+    );
+    const r = spawnSync(process.execPath, [GATE, "--debt"], {
+      cwd: repo, encoding: "utf8", env: { ...process.env, GATE_STATE_DIR: sd },
+    });
+    expect(r.stdout).toContain("Comprehension debt");
+    expect(r.stdout).toContain("100% explained");
+  });
+
+  test("--debt outside a git repo says so", () => {
+    const r = spawnSync(process.execPath, [GATE, "--debt"], {
+      cwd: td(), encoding: "utf8", env: { ...process.env, GATE_STATE_DIR: td() },
+    });
+    expect(r.stdout).toContain("Not a git repo");
+  });
+
+  test("statusline segment: streak + focus; empty on no data", () => {
+    expect(statuslineSegment([], ANCHOR)).toBe("");
+    const gaps = [
+      { ts: daysAgoIso(0, 10), sha: "a", file: "x.ts", score: 2, missed: "", skipped: false, concepts: ["regex"] },
+      { ts: daysAgoIso(1, 10), sha: "b", file: "y.ts", score: 0, missed: "", skipped: false, concepts: ["regex"] },
+      { ts: daysAgoIso(2, 10), sha: "c", file: "z.ts", score: 0, missed: "", skipped: false, concepts: ["regex"] },
+    ];
+    const seg = statuslineSegment(gaps, ANCHOR);
+    expect(seg).toContain("🔥1d"); // only today qualifies (score 2)
+    expect(seg).toContain("regular expressions"); // struggling focus
+    const targeted = statuslineSegment([...gaps, { type: "target", ts: daysAgoIso(0), concept: "devops-ci", on: true }], ANCHOR);
+    expect(targeted).toContain("CI/CD & workflows"); // target outranks struggling
+  });
+
+  test("isoWeek is stable across a week boundary", () => {
+    expect(isoWeek(new Date(2026, 0, 1))).toMatch(/^\d{4}-W\d{2}$/);
+    expect(isoWeek(new Date(2026, 6, 13))).toBe(isoWeek(new Date(2026, 6, 19))); // Mon..Sun same week
+  });
+
+  test("knowledge page: sections present; empty log handled", () => {
+    expect(knowledgePage([], ANCHOR)).toContain("No data yet");
+    const gaps = [
+      { ts: daysAgoIso(10), sha: "a", file: "s1.ts", score: 2, missed: "", skipped: false, concepts: ["error-handling"], repo: "r1" },
+      { ts: daysAgoIso(8), sha: "b", file: "s2.ts", score: 2, missed: "", skipped: false, concepts: ["error-handling"], repo: "r1" },
+      { ts: daysAgoIso(5), sha: "c", file: "s3.ts", score: 2, missed: "", skipped: false, concepts: ["error-handling"], repo: "r2" },
+      { ts: daysAgoIso(1), sha: "d", file: "w.ts", score: 0, missed: "lazy match", skipped: false, concepts: ["regex"], repo: "r1" },
+      { ts: daysAgoIso(0), sha: "e", file: "w2.ts", score: 0, missed: "", skipped: false, concepts: ["regex"], repo: "r1" },
+      { type: "target", ts: daysAgoIso(2), concept: "devops-ci", on: true },
+    ];
+    const page = knowledgePage(gaps, ANCHOR);
+    expect(page).toContain("## Strengths");
+    expect(page).toContain("error handling");
+    expect(page).toContain("## Growth targets");
+    expect(page).toContain("no attempts since targeting yet");
+    expect(page).toContain("## Weekly progress");
+    expect(page).toContain("## Pushing against");
+    expect(page).toContain("last missed: lazy match");
+    expect(page).toContain("## Repos");
+  });
+
+  test("--export-md writes the page (end-to-end)", () => {
+    const sd = td();
+    const out = runCli(["--export-md"], sd);
+    expect(out).toContain("Wrote");
+    expect(readFileSync(join(sd, "KNOWLEDGE.md"), "utf8")).toContain("No data yet");
+  });
+});
+
+// ---------- Group 17: /quiz ----------
+
+describe("quiz", () => {
+  function runQuiz(cwd: string, sd: string, arg?: string) {
+    const args = arg ? [GATE, "--quiz", arg] : [GATE, "--quiz"];
+    const r = spawnSync(process.execPath, args, {
+      cwd, encoding: "utf8", env: { ...process.env, GATE_STATE_DIR: sd },
+    });
+    return (r.stdout ?? "").trim();
+  }
+
+  test("riskiestWindow picks the dense window and caps size", () => {
+    const calm = Array.from({ length: 30 }, (_, i) => `const a${i} = ${i};`);
+    const dense = [
+      "export function risky(x: number) {",
+      "  try { if (x) { throw new Error('x'); } } catch (e) { return -1; }",
+      "  for (let i = 0; i < x; i++) { if (i % 2) continue; }",
+      "  return 0;",
+      "}",
+    ];
+    const w = riskiestWindow([...calm, ...calm, ...dense], "x.ts");
+    expect(w).toBeTruthy();
+    expect(w!.text.split("\n")[0]).toMatch(/^@@ x\.ts:\d+-\d+ @@$/);
+    expect(w!.end - w!.start).toBeLessThanOrEqual(50);
+    expect(w!.concepts).toContain("error-handling");
+    expect(riskiestWindow([], "x.ts")).toBeNull();
+  });
+
+  test("quiz on a file prints the gate prompt with via:quiz, bypassing snooze", () => {
+    const { repo } = initRepo();
+    const sd = td();
+    seedState(sd, { snooze_until: new Date(Date.now() + 3600_000).toISOString(), daily_count: 3, day: localDay(new Date()) });
+    writeFileSync(join(repo, "risky.ts"), RISKY);
+    const out = runQuiz(repo, sd, "risky.ts");
+    expect(out).toContain("COMPREHENSION GATE");
+    expect(out).toContain('"via":"quiz"');
+    expect(out).toContain("risky.ts");
+    const { state } = readState(sd);
+    expect(state.last_gate_ts).toBeTruthy(); // gap timer set
+    expect(state.daily_count).toBe(3); // untouched
+  });
+
+  test("quiz with no arg uses the current diff", () => {
+    const { repo, sha } = initRepo();
+    const sd = td();
+    seedState(sd, { last_sha: sha });
+    writeFileSync(join(repo, "risky.ts"), RISKY);
+    expect(runQuiz(repo, sd)).toContain("COMPREHENSION GATE");
+  });
+
+  test("quiz on a directory picks the riskiest file", () => {
+    const { repo } = initRepo();
+    const sd = td();
+    spawnSync("mkdir", ["-p", join(repo, "src")]);
+    writeFileSync(join(repo, "src", "calm.ts"), "export const x = 1;\n");
+    writeFileSync(join(repo, "src", "risky.ts"), RISKY);
+    sh(repo, ["git", "add", "-A"]);
+    const out = runQuiz(repo, sd, "src");
+    expect(out).toContain("COMPREHENSION GATE");
+    expect(out).toContain("src/risky.ts");
+  });
+
+  test("degenerate inputs get friendly messages", () => {
+    const { repo } = initRepo();
+    const sd = td();
+    expect(runQuiz(repo, sd, "nope.ts")).toContain("No such path");
+    writeFileSync(join(repo, "empty.ts"), "");
+    expect(runQuiz(repo, sd, "empty.ts")).toContain("empty");
+    writeFileSync(join(repo, "bin.ts"), "abc\0def");
+    expect(runQuiz(repo, sd, "bin.ts")).toContain("binary");
+    writeFileSync(join(repo, "deps.lock"), "x");
+    expect(runQuiz(repo, sd, "deps.lock")).toContain("not a quizzable");
+    expect(runQuiz(repo, sd)).toContain("Nothing to quiz"); // clean tree, single commit → no diff
   });
 });
